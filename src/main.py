@@ -163,12 +163,13 @@ PIECE_VALUES = {
 }
 
 class Piece:
-    def __init__(self, color, kind):
+    def __init__(self, color, kind, moved=False):
         self.color = color
         self.kind = kind  # 'P','N','B','R','Q','K'
+        self.moved = moved
 
     def __repr__(self):
-        return f"{self.color[0]}{self.kind}"
+        return f"{self.color[0]}{self.kind}{'*' if self.moved else ''}"
 
 
 def create_start_board():
@@ -221,8 +222,31 @@ def is_friend(piece, color):
 
 
 def clone_board(board):
-    return [[board[r][c] if board[r][c] is None else Piece(board[r][c].color, board[r][c].kind)
+    return [[board[r][c] if board[r][c] is None else Piece(board[r][c].color, board[r][c].kind, board[r][c].moved)
              for c in range(8)] for r in range(8)]
+
+
+def other(color):
+    return WHITE if color == BLACK else BLACK
+
+
+def move_parts(move):
+    return move[0], move[1], move[2], move[3]
+
+
+def move_flag(move):
+    return move[4] if len(move) > 4 else ""
+
+
+def same_square_move(a, b):
+    return tuple(a[:4]) == tuple(b[:4])
+
+
+def find_matching_move(target_move, legal_moves):
+    for move in legal_moves:
+        if same_square_move(move, target_move):
+            return move
+    return None
 
 
 def find_king(board, color):
@@ -234,7 +258,76 @@ def find_king(board, color):
     return None
 
 
-def generate_moves_for_piece(board, r, c):
+def target_is_enemy_king(board, r, c, color):
+    target = board[r][c]
+    return target is not None and target.color != color and target.kind == "K"
+
+
+def is_square_attacked(board, row, col, by_color):
+    """True when by_color attacks (row, col). Pawns are handled as attacks only,
+    not as normal forward moves. This fixes false check/checkmate detection."""
+    pawn_dir = -1 if by_color == WHITE else 1
+    for dc in (-1, 1):
+        pr, pc = row - pawn_dir, col - dc
+        if in_bounds(pr, pc):
+            p = board[pr][pc]
+            if p and p.color == by_color and p.kind == "P":
+                return True
+
+    for dr, dc in [(2, 1), (2, -1), (-2, 1), (-2, -1),
+                   (1, 2), (1, -2), (-1, 2), (-1, -2)]:
+        nr, nc = row + dr, col + dc
+        if in_bounds(nr, nc):
+            p = board[nr][nc]
+            if p and p.color == by_color and p.kind == "N":
+                return True
+
+    # Bishop/queen diagonals
+    for dr, dc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        nr, nc = row + dr, col + dc
+        while in_bounds(nr, nc):
+            p = board[nr][nc]
+            if p:
+                if p.color == by_color and p.kind in ("B", "Q"):
+                    return True
+                break
+            nr += dr
+            nc += dc
+
+    # Rook/queen lines
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nr, nc = row + dr, col + dc
+        while in_bounds(nr, nc):
+            p = board[nr][nc]
+            if p:
+                if p.color == by_color and p.kind in ("R", "Q"):
+                    return True
+                break
+            nr += dr
+            nc += dc
+
+    # King attacks
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, nc = row + dr, col + dc
+            if in_bounds(nr, nc):
+                p = board[nr][nc]
+                if p and p.color == by_color and p.kind == "K":
+                    return True
+
+    return False
+
+
+def is_in_check(board, color):
+    king_pos = find_king(board, color)
+    if not king_pos:
+        return True
+    return is_square_attacked(board, king_pos[0], king_pos[1], other(color))
+
+
+def generate_moves_for_piece(board, r, c, en_passant_target=None, include_castling=True):
     moves = []
     piece = board[r][c]
     if not piece:
@@ -242,7 +335,6 @@ def generate_moves_for_piece(board, r, c):
 
     color = piece.color
     kind = piece.kind
-
     directions = []
 
     # Pawn
@@ -250,20 +342,32 @@ def generate_moves_for_piece(board, r, c):
         dir = -1 if color == WHITE else 1
         start_row = 6 if color == WHITE else 1
 
-        # forward
+        # forward one and two squares
         nr = r + dir
         if in_bounds(nr, c) and board[nr][c] is None:
-            moves.append((r, c, nr, c))
+            flag = "promotion" if nr in (0, 7) else ""
+            moves.append((r, c, nr, c, flag))
             nr2 = r + 2 * dir
-            if r == start_row and board[nr2][c] is None:
-                moves.append((r, c, nr2, c))
+            if r == start_row and in_bounds(nr2, c) and board[nr2][c] is None:
+                moves.append((r, c, nr2, c, "double_pawn"))
 
-        # captures
+        # normal captures + promotion captures
         for dc in [-1, 1]:
             nc = c + dc
             nr = r + dir
-            if in_bounds(nr, nc) and board[nr][nc] and board[nr][nc].color != color:
-                moves.append((r, c, nr, nc))
+            if in_bounds(nr, nc):
+                target = board[nr][nc]
+                if target and target.color != color and target.kind != "K":
+                    flag = "promotion" if nr in (0, 7) else ""
+                    moves.append((r, c, nr, nc, flag))
+
+        # en passant capture
+        if en_passant_target:
+            ep_r, ep_c = en_passant_target
+            if ep_r == r + dir and abs(ep_c - c) == 1:
+                adjacent = board[r][ep_c]
+                if adjacent and adjacent.color != color and adjacent.kind == "P":
+                    moves.append((r, c, ep_r, ep_c, "en_passant"))
 
     # Knight
     elif kind == "N":
@@ -271,8 +375,8 @@ def generate_moves_for_piece(board, r, c):
                  (1, 2), (1, -2), (-1, 2), (-1, -2)]
         for dr, dc in jumps:
             nr, nc = r + dr, c + dc
-            if in_bounds(nr, nc) and not is_friend(board[nr][nc], color):
-                moves.append((r, c, nr, nc))
+            if in_bounds(nr, nc) and not is_friend(board[nr][nc], color) and not target_is_enemy_king(board, nr, nc, color):
+                moves.append((r, c, nr, nc, ""))
 
     # Bishop
     elif kind == "B":
@@ -294,8 +398,29 @@ def generate_moves_for_piece(board, r, c):
                  (1, -1),  (1, 0), (1, 1)]
         for dr, dc in steps:
             nr, nc = r + dr, c + dc
-            if in_bounds(nr, nc) and not is_friend(board[nr][nc], color):
-                moves.append((r, c, nr, nc))
+            if in_bounds(nr, nc) and not is_friend(board[nr][nc], color) and not target_is_enemy_king(board, nr, nc, color):
+                moves.append((r, c, nr, nc, ""))
+
+        # Castling: king and rook have not moved, path is clear, and king does not pass through check.
+        if include_castling and not piece.moved and not is_in_check(board, color):
+            home_row = 7 if color == WHITE else 0
+            enemy = other(color)
+            if r == home_row and c == 4:
+                # Kingside castling: e1/e8 to g1/g8; rook h-file to f-file
+                rook = board[home_row][7]
+                if (rook and rook.color == color and rook.kind == "R" and not rook.moved and
+                        board[home_row][5] is None and board[home_row][6] is None and
+                        not is_square_attacked(board, home_row, 5, enemy) and
+                        not is_square_attacked(board, home_row, 6, enemy)):
+                    moves.append((r, c, home_row, 6, "castle_kingside"))
+
+                # Queenside castling: e1/e8 to c1/c8; rook a-file to d-file
+                rook = board[home_row][0]
+                if (rook and rook.color == color and rook.kind == "R" and not rook.moved and
+                        board[home_row][1] is None and board[home_row][2] is None and board[home_row][3] is None and
+                        not is_square_attacked(board, home_row, 3, enemy) and
+                        not is_square_attacked(board, home_row, 2, enemy)):
+                    moves.append((r, c, home_row, 2, "castle_queenside"))
 
     # Sliding pieces (Bishop, Rook, Queen)
     if directions:
@@ -303,10 +428,10 @@ def generate_moves_for_piece(board, r, c):
             nr, nc = r + dr, c + dc
             while in_bounds(nr, nc):
                 if board[nr][nc] is None:
-                    moves.append((r, c, nr, nc))
+                    moves.append((r, c, nr, nc, ""))
                 else:
-                    if board[nr][nc].color != color:
-                        moves.append((r, c, nr, nc))
+                    if board[nr][nc].color != color and board[nr][nc].kind != "K":
+                        moves.append((r, c, nr, nc, ""))
                     break
                 nr += dr
                 nc += dc
@@ -314,63 +439,174 @@ def generate_moves_for_piece(board, r, c):
     return moves
 
 
-def make_move(board, move):
-    r1, c1, r2, c2 = move
+def get_next_en_passant_target(board, move):
+    r1, c1, r2, c2 = move_parts(move)
     piece = board[r1][c1]
-    captured = board[r2][c2]
+    if piece and piece.kind == "P" and abs(r2 - r1) == 2:
+        return ((r1 + r2) // 2, c1)
+    return None
+
+
+def make_move(board, move):
+    r1, c1, r2, c2 = move_parts(move)
+    flag = move_flag(move)
+    piece = board[r1][c1]
+
+    record = {
+        "captured": board[r2][c2],
+        "captured_square": (r2, c2),
+        "piece_prev_kind": piece.kind if piece else None,
+        "piece_prev_moved": piece.moved if piece else False,
+        "rook_move": None,
+    }
+
+    # En passant captures the pawn behind the target square, not on the target square.
+    if flag == "en_passant":
+        cap_r, cap_c = r1, c2
+        record["captured"] = board[cap_r][cap_c]
+        record["captured_square"] = (cap_r, cap_c)
+        board[cap_r][cap_c] = None
 
     board[r2][c2] = piece
     board[r1][c1] = None
+    if piece:
+        piece.moved = True
 
-    # promotion
-    if piece.kind == "P":
-        if piece.color == WHITE and r2 == 0:
-            piece.kind = "Q"
-        if piece.color == BLACK and r2 == 7:
-            piece.kind = "Q"
+    # Move rook for castling.
+    if flag == "castle_kingside":
+        rook_from = (r1, 7)
+        rook_to = (r1, 5)
+        rook = board[rook_from[0]][rook_from[1]]
+        record["rook_move"] = (rook_from, rook_to, rook.moved if rook else False)
+        board[rook_to[0]][rook_to[1]] = rook
+        board[rook_from[0]][rook_from[1]] = None
+        if rook:
+            rook.moved = True
+    elif flag == "castle_queenside":
+        rook_from = (r1, 0)
+        rook_to = (r1, 3)
+        rook = board[rook_from[0]][rook_from[1]]
+        record["rook_move"] = (rook_from, rook_to, rook.moved if rook else False)
+        board[rook_to[0]][rook_to[1]] = rook
+        board[rook_from[0]][rook_from[1]] = None
+        if rook:
+            rook.moved = True
 
-    return captured
+    # Auto promote to queen. The previous kind is restored in undo_move.
+    if piece and piece.kind == "P" and r2 in (0, 7):
+        piece.kind = "Q"
+
+    return record
 
 
-def undo_move(board, move, captured):
-    r1, c1, r2, c2 = move
+def undo_move(board, move, record):
+    r1, c1, r2, c2 = move_parts(move)
     piece = board[r2][c2]
+
+    # Move rook back first if castling.
+    if record.get("rook_move"):
+        rook_from, rook_to, rook_prev_moved = record["rook_move"]
+        rook = board[rook_to[0]][rook_to[1]]
+        board[rook_from[0]][rook_from[1]] = rook
+        board[rook_to[0]][rook_to[1]] = None
+        if rook:
+            rook.moved = rook_prev_moved
+
     board[r1][c1] = piece
-    board[r2][c2] = captured
+    board[r2][c2] = None
+
+    if piece:
+        piece.kind = record["piece_prev_kind"]
+        piece.moved = record["piece_prev_moved"]
+
+    captured = record.get("captured")
+    cap_square = record.get("captured_square", (r2, c2))
+    if captured:
+        board[cap_square[0]][cap_square[1]] = captured
+    else:
+        # Normal non-capture moves should keep the destination empty after undo.
+        board[r2][c2] = None
 
 
-def is_in_check(board, color):
-    king_pos = find_king(board, color)
-    if not king_pos:
-        return True
-
-    kr, kc = king_pos
-    enemy = WHITE if color == BLACK else BLACK
-
-    for r in range(8):
-        for c in range(8):
-            p = board[r][c]
-            if p and p.color == enemy:
-                for m in generate_moves_for_piece(board, r, c):
-                    _, _, tr, tc = m
-                    if tr == kr and tc == kc:
-                        return True
-
-    return False
-
-
-def generate_legal_moves(board, color):
-    moves = []
+def generate_legal_moves(board, color, en_passant_target=None):
+    legal_moves = []
     for r in range(8):
         for c in range(8):
             p = board[r][c]
             if p and p.color == color:
-                for m in generate_moves_for_piece(board, r, c):
-                    captured = make_move(board, m)
+                for move in generate_moves_for_piece(board, r, c, en_passant_target, include_castling=True):
+                    record = make_move(board, move)
                     if not is_in_check(board, color):
-                        moves.append(m)
-                    undo_move(board, m, captured)
-    return moves
+                        legal_moves.append(move)
+                    undo_move(board, move, record)
+    return legal_moves
+
+
+# Piece-square tables are from White's perspective. Black pieces use the mirrored row.
+PST = {
+    "P": [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [50, 50, 50, 50, 50, 50, 50, 50],
+        [10, 10, 20, 30, 30, 20, 10, 10],
+        [5, 5, 10, 25, 25, 10, 5, 5],
+        [0, 0, 0, 20, 20, 0, 0, 0],
+        [5, -5, -10, 0, 0, -10, -5, 5],
+        [5, 10, 10, -20, -20, 10, 10, 5],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    "N": [
+        [-50, -40, -30, -30, -30, -30, -40, -50],
+        [-40, -20, 0, 5, 5, 0, -20, -40],
+        [-30, 5, 10, 15, 15, 10, 5, -30],
+        [-30, 0, 15, 20, 20, 15, 0, -30],
+        [-30, 5, 15, 20, 20, 15, 5, -30],
+        [-30, 0, 10, 15, 15, 10, 0, -30],
+        [-40, -20, 0, 0, 0, 0, -20, -40],
+        [-50, -40, -30, -30, -30, -30, -40, -50],
+    ],
+    "B": [
+        [-20, -10, -10, -10, -10, -10, -10, -20],
+        [-10, 5, 0, 0, 0, 0, 5, -10],
+        [-10, 10, 10, 10, 10, 10, 10, -10],
+        [-10, 0, 10, 10, 10, 10, 0, -10],
+        [-10, 5, 5, 10, 10, 5, 5, -10],
+        [-10, 0, 5, 10, 10, 5, 0, -10],
+        [-10, 0, 0, 0, 0, 0, 0, -10],
+        [-20, -10, -10, -10, -10, -10, -10, -20],
+    ],
+    "R": [
+        [0, 0, 0, 5, 5, 0, 0, 0],
+        [-5, 0, 0, 0, 0, 0, 0, -5],
+        [-5, 0, 0, 0, 0, 0, 0, -5],
+        [-5, 0, 0, 0, 0, 0, 0, -5],
+        [-5, 0, 0, 0, 0, 0, 0, -5],
+        [-5, 0, 0, 0, 0, 0, 0, -5],
+        [5, 10, 10, 10, 10, 10, 10, 5],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    "Q": [
+        [-20, -10, -10, -5, -5, -10, -10, -20],
+        [-10, 0, 0, 0, 0, 0, 0, -10],
+        [-10, 0, 5, 5, 5, 5, 0, -10],
+        [-5, 0, 5, 5, 5, 5, 0, -5],
+        [0, 0, 5, 5, 5, 5, 0, -5],
+        [-10, 5, 5, 5, 5, 5, 0, -10],
+        [-10, 0, 5, 0, 0, 0, 0, -10],
+        [-20, -10, -10, -5, -5, -10, -10, -20],
+    ],
+    "K": [
+        [20, 30, 10, 0, 0, 10, 30, 20],
+        [20, 20, 0, 0, 0, 0, 20, 20],
+        [-10, -20, -20, -20, -20, -20, -20, -10],
+        [-20, -30, -30, -40, -40, -30, -30, -20],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+    ],
+}
+
+CHECKMATE_SCORE = 1000000
 
 
 def evaluate_board(board):
@@ -378,59 +614,159 @@ def evaluate_board(board):
     for r in range(8):
         for c in range(8):
             p = board[r][c]
-            if p:
-                val = PIECE_VALUES[p.kind]
-                score += val if p.color == WHITE else -val
+            if not p:
+                continue
+            base = PIECE_VALUES[p.kind]
+            table_row = r if p.color == WHITE else 7 - r
+            positional = PST[p.kind][table_row][c]
+            value = base + positional
+            score += value if p.color == WHITE else -value
+
+    # Keep evaluation lightweight so the Pygame window does not freeze after a move.
+    # Mobility was removed from the leaf evaluation because it recursively generated
+    # legal moves at every minimax leaf and made the AI feel like the game had crashed.
     return score
 
 
-def minimax(board, depth, alpha, beta, maximizing, color_to_move):
-    if depth == 0:
+def move_score_for_ordering(board, move):
+    r1, c1, r2, c2 = move_parts(move)
+    flag = move_flag(move)
+    moving = board[r1][c1]
+    captured = board[r2][c2]
+    score = 0
+
+    if captured:
+        score += 10 * PIECE_VALUES[captured.kind] - PIECE_VALUES[moving.kind]
+    if flag == "en_passant":
+        score += 900
+    if flag in ("promotion",):
+        score += 850
+    if flag.startswith("castle"):
+        score += 80
+
+    # Prefer central development slightly.
+    if (r2, c2) in [(3, 3), (3, 4), (4, 3), (4, 4)]:
+        score += 25
+    if moving and moving.kind in ("N", "B") and not moving.moved:
+        score += 12
+    return score
+
+
+def ordered_moves(board, moves):
+    moves = list(moves)
+    random.shuffle(moves)
+    moves.sort(key=lambda m: move_score_for_ordering(board, m), reverse=True)
+    return moves
+
+
+def minimax(board, depth, alpha, beta, maximizing, color_to_move, en_passant_target=None):
+    # The board evaluation is positive for White and negative for Black.
+    maximizing = (color_to_move == WHITE)
+
+    legal_moves = generate_legal_moves(board, color_to_move, en_passant_target)
+    if depth == 0 or not legal_moves:
+        if not legal_moves:
+            if is_in_check(board, color_to_move):
+                return ((-CHECKMATE_SCORE - depth) if color_to_move == WHITE else (CHECKMATE_SCORE + depth)), None
+            return 0, None
         return evaluate_board(board), None
 
-    moves = generate_legal_moves(board, color_to_move)
-    if not moves:
-        if is_in_check(board, color_to_move):
-            return (-999999 if maximizing else 999999), None
-        else:
-            return 0, None
-
-    enemy = WHITE if color_to_move == BLACK else BLACK
+    enemy = other(color_to_move)
     best_move = None
 
     if maximizing:
-        max_eval = -math.inf
-        for m in moves:
-            captured = make_move(board, m)
-            eval_score, _ = minimax(board, depth - 1, alpha, beta, False, enemy)
-            undo_move(board, m, captured)
+        best_eval = -math.inf
+        for move in ordered_moves(board, legal_moves):
+            next_ep = get_next_en_passant_target(board, move)
+            record = make_move(board, move)
+            eval_score, _ = minimax(board, depth - 1, alpha, beta, False, enemy, next_ep)
+            undo_move(board, move, record)
 
-            if eval_score > max_eval:
-                max_eval = eval_score
-                best_move = m
-
+            if eval_score > best_eval:
+                best_eval = eval_score
+                best_move = move
             alpha = max(alpha, eval_score)
             if beta <= alpha:
                 break
-
-        return max_eval, best_move
+        return best_eval, best_move
 
     else:
-        min_eval = math.inf
-        for m in moves:
-            captured = make_move(board, m)
-            eval_score, _ = minimax(board, depth - 1, alpha, beta, True, enemy)
-            undo_move(board, m, captured)
+        best_eval = math.inf
+        for move in ordered_moves(board, legal_moves):
+            next_ep = get_next_en_passant_target(board, move)
+            record = make_move(board, move)
+            eval_score, _ = minimax(board, depth - 1, alpha, beta, True, enemy, next_ep)
+            undo_move(board, move, record)
 
-            if eval_score < min_eval:
-                min_eval = eval_score
-                best_move = m
-
+            if eval_score < best_eval:
+                best_eval = eval_score
+                best_move = move
             beta = min(beta, eval_score)
             if beta <= alpha:
                 break
+        return best_eval, best_move
 
-        return min_eval, best_move
+
+def opening_book_move(board, color, legal_moves, move_stack):
+    """Small opening book for natural early development. It is only used when the
+    book move is legal, then minimax takes over after the opening."""
+    if color != BLACK or len(move_stack) > 8:
+        return None
+
+    history = [tuple(item["move"][:4]) for item in move_stack]
+    book = {
+        ((6, 4, 4, 4),): [(1, 4, 3, 4), (1, 2, 3, 2), (1, 3, 3, 3)],  # vs e4: e5/c5/d5
+        ((6, 3, 4, 3),): [(1, 3, 3, 3), (0, 6, 2, 5)],              # vs d4: d5/Nf6
+        ((6, 2, 4, 2),): [(1, 4, 3, 4), (0, 6, 2, 5)],              # vs c4: e5/Nf6
+        ((7, 6, 5, 5),): [(1, 3, 3, 3), (0, 6, 2, 5)],              # vs Nf3
+        ((6, 4, 4, 4), (1, 4, 3, 4), (7, 6, 5, 5)): [(0, 1, 2, 2), (0, 6, 2, 5)],
+        ((6, 4, 4, 4), (1, 4, 3, 4), (7, 5, 4, 2)): [(0, 1, 2, 2), (0, 6, 2, 5)],
+        ((6, 3, 4, 3), (1, 3, 3, 3), (7, 6, 5, 5)): [(0, 6, 2, 5), (1, 4, 2, 4)],
+    }
+
+    candidates = book.get(tuple(history))
+    if not candidates:
+        return None
+
+    legal_first4 = {tuple(m[:4]): m for m in legal_moves}
+    random.shuffle(candidates)
+    for candidate in candidates:
+        if tuple(candidate) in legal_first4:
+            return legal_first4[tuple(candidate)]
+    return None
+
+
+def choose_ai_move(board, color, depth, en_passant_target, move_stack):
+    legal_moves = generate_legal_moves(board, color, en_passant_target)
+    if not legal_moves:
+        return 0, None
+
+    book_move = opening_book_move(board, color, legal_moves, move_stack)
+    if book_move:
+        return evaluate_board(board), book_move
+
+    return minimax(board, depth, -math.inf, math.inf, color == WHITE, color, en_passant_target)
+
+
+def get_game_status(board, current_turn, en_passant_target):
+    legal_moves = generate_legal_moves(board, current_turn, en_passant_target)
+    if legal_moves:
+        if is_in_check(board, current_turn):
+            return {"type": "check", "title": "Check", "message": f"{'White' if current_turn == WHITE else 'Black'} is in check."}
+        return None
+
+    if is_in_check(board, current_turn):
+        winner = "Black" if current_turn == WHITE else "White"
+        return {
+            "type": "checkmate",
+            "title": "Checkmate",
+            "message": f"{winner} wins by checkmate!",
+        }
+    return {
+        "type": "stalemate",
+        "title": "Stalemate",
+        "message": "Draw: the player to move has no legal moves and is not in check.",
+    }
 
 # =========================
 # UI HELPERS, BOARD, DRAGGER, PIECE DRAWING, LEGAL MOVE DOTS
@@ -545,7 +881,7 @@ def draw_piece_at(surface, piece, x, y):
     surface.blit(img, rect)
 
 
-def draw_board(surface, board, last_move, hover_square, dragger):
+def draw_board(surface, board, last_move, hover_square, dragger, en_passant_target=None):
     # Outer frame and border
     frame_rect = pygame.Rect(BOARD_X - 14, BOARD_Y - 14, BOARD_SIZE + 28, BOARD_SIZE + 28)
     draw_card(surface, frame_rect, fill=COLOR_BOARD_FRAME, border=COLOR_BOARD_BORDER, radius=18, alpha=255)
@@ -563,9 +899,9 @@ def draw_board(surface, board, last_move, hover_square, dragger):
             else:
                 pygame.draw.line(surface, (0, 0, 0, 18), rect.bottomleft, rect.bottomright)
 
-    # Highlight last move
+    # Highlight last move. Moves may be 4-tuples or 5-tuples with a special-rule flag.
     if last_move:
-        r1, c1, r2, c2 = last_move
+        r1, c1, r2, c2 = move_parts(last_move)
         for rr, cc in [(r1, c1), (r2, c2)]:
             rect = pygame.Rect(BOARD_X + cc * SQSIZE, BOARD_Y + rr * SQSIZE, SQSIZE, SQSIZE)
             s = pygame.Surface((SQSIZE, SQSIZE), pygame.SRCALPHA)
@@ -591,9 +927,9 @@ def draw_board(surface, board, last_move, hover_square, dragger):
 
     # Legal move dots and capture rings
     if dragger.dragging and dragger.piece:
-        legal_moves = generate_legal_moves(board, dragger.piece.color)
+        legal_moves = generate_legal_moves(board, dragger.piece.color, en_passant_target)
         for m in legal_moves:
-            r1, c1, r2, c2 = m
+            r1, c1, r2, c2 = move_parts(m)
             if r1 == dragger.start_row and c1 == dragger.start_col:
                 cx = BOARD_X + c2 * SQSIZE + SQSIZE // 2
                 cy = BOARD_Y + r2 * SQSIZE + SQSIZE // 2
@@ -815,7 +1151,7 @@ def draw_difficulty_menu(surface):
     panels = [
         (easy_panel, "Basic", "Depth 1", "Fast moves"),
         (med_panel, "Intermediate", "Depth 3", "Balanced"),
-        (hard_panel, "Advanced", "Depth 4", "Stronger AI"),
+        (hard_panel, "Advanced", "Depth 3", "Stronger AI"),
     ]
     for rect, title, depth, desc in panels:
         draw_card(surface, rect, fill=COLOR_CARD, border=COLOR_ACCENT if title == "Intermediate" else COLOR_BORDER, radius=22)
@@ -829,14 +1165,34 @@ def draw_difficulty_menu(surface):
 # MAIN LOOP + BOT LOGIC
 # =========================
 
-def move_to_notation(board, move, captured):
-    r1, c1, r2, c2 = move
+def move_to_notation(board, move, record, gives_check=False, is_mate=False):
+    r1, c1, r2, c2 = move_parts(move)
+    flag = move_flag(move)
     piece = board[r2][c2]
-    col_letter = "abcdefgh"[c2]
-    row_number = 8 - r2
-    prefix = piece.kind if piece.kind != "P" else "P"
-    capture_mark = "x" if captured else "-"
-    return f"{prefix}{capture_mark}{col_letter}{row_number}"
+    captured = record.get("captured") if isinstance(record, dict) else None
+
+    if flag == "castle_kingside":
+        notation = "O-O"
+    elif flag == "castle_queenside":
+        notation = "O-O-O"
+    else:
+        dest = f"{'abcdefgh'[c2]}{8 - r2}"
+        capture_mark = "x" if captured else ""
+        if piece.kind == "P":
+            prefix = "" if not captured else "abcdefgh"[c1]
+        else:
+            prefix = piece.kind
+        notation = f"{prefix}{capture_mark}{dest}"
+        if flag == "promotion":
+            notation += "=Q"
+        if flag == "en_passant":
+            notation += " e.p."
+
+    if is_mate:
+        notation += "#"
+    elif gives_check:
+        notation += "+"
+    return notation
 
 
 def bot_say(chat_lines, text):
@@ -845,20 +1201,77 @@ def bot_say(chat_lines, text):
         chat_lines.pop(0)
 
 
+def add_captured_piece(captured_white, captured_black, mover, captured):
+    if not captured:
+        return
+    if mover == WHITE:
+        captured_white.append(captured)
+    else:
+        captured_black.append(captured)
+
+
+def remove_captured_piece(captured_white, captured_black, mover, captured):
+    if not captured:
+        return
+    if mover == WHITE and captured_white:
+        captured_white.pop()
+    elif mover == BLACK and captured_black:
+        captured_black.pop()
+
+
+def apply_game_move(board, move, mover, move_history, move_stack, captured_white, captured_black, en_passant_target):
+    prev_ep = en_passant_target
+    next_ep = get_next_en_passant_target(board, move)
+    record = make_move(board, move)
+    captured = record.get("captured")
+    add_captured_piece(captured_white, captured_black, mover, captured)
+
+    next_turn = other(mover)
+    status_after = get_game_status(board, next_turn, next_ep)
+    gives_check = bool(status_after and status_after["type"] in ("check", "checkmate"))
+    is_mate = bool(status_after and status_after["type"] == "checkmate")
+    notation = move_to_notation(board, move, record, gives_check, is_mate)
+
+    move_history.append(notation)
+    move_stack.append({
+        "move": move,
+        "record": record,
+        "mover": mover,
+        "prev_ep": prev_ep,
+        "next_ep": next_ep,
+        "notation": notation,
+    })
+    return next_ep, status_after, notation
+
+
 def undo_last_move(board, move_history, move_stack, captured_white, captured_black):
     if not move_stack:
-        return None
-    record = move_stack.pop()
-    move, captured, mover = record
-    undo_move(board, move, captured)
-    if captured:
-        if mover == WHITE and captured_white:
-            captured_white.pop()
-        elif mover == BLACK and captured_black:
-            captured_black.pop()
+        return None, None
+    item = move_stack.pop()
+    undo_move(board, item["move"], item["record"])
+    remove_captured_piece(captured_white, captured_black, item["mover"], item["record"].get("captured"))
     if move_history:
         move_history.pop()
-    return mover
+    return item["mover"], item["prev_ep"]
+
+
+def draw_game_over_popup(surface, title, message):
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 155))
+    surface.blit(overlay, (0, 0))
+
+    popup_w, popup_h = 540, 290
+    rect = pygame.Rect((WINDOW_WIDTH - popup_w) // 2, (WINDOW_HEIGHT - popup_h) // 2, popup_w, popup_h)
+    draw_card(surface, rect, fill=(25, 31, 42), border=COLOR_ACCENT, radius=24, alpha=250)
+
+    blit_text(surface, title, FONT_TITLE, COLOR_ACCENT, (rect.centerx, rect.y + 58), "center")
+    blit_text(surface, message, FONT_SUBTITLE, COLOR_TEXT, (rect.centerx, rect.y + 128), "center")
+
+    menu_button = pygame.Rect(rect.x + 56, rect.bottom - 88, 190, 52)
+    exit_button = pygame.Rect(rect.right - 246, rect.bottom - 88, 190, 52)
+    draw_button(surface, menu_button, "Main Menu", primary=True)
+    draw_button(surface, exit_button, "Exit Game")
+    return {"menu": menu_button, "exit": exit_button}
 
 
 def run_game(mode):
@@ -877,49 +1290,61 @@ def run_game(mode):
     white_time = 15 * 60
     black_time = 15 * 60
     buttons = {}
+    popup_buttons = {}
     clock = pygame.time.Clock()
+    en_passant_target = None
+    game_over = None
 
     running = True
     bot_thinking = False
 
     while running:
         dt = clock.tick(60) / 1000
-        if current_turn == WHITE:
-            white_time -= dt
-        else:
-            black_time -= dt
+
+        if not game_over:
+            if current_turn == WHITE:
+                white_time -= dt
+                if white_time <= 0:
+                    game_over = {"type": "timeout", "title": "Time Out", "message": "Black wins on time!"}
+            else:
+                black_time -= dt
+                if black_time <= 0:
+                    game_over = {"type": "timeout", "title": "Time Out", "message": "White wins on time!"}
 
         draw_vertical_gradient(screen, COLOR_BG_TOP, COLOR_BG_BOTTOM)
         blit_text(screen, "♛ Chess", FONT_CARD_TITLE, COLOR_ACCENT, (WINDOW_WIDTH // 2, 22), "center")
 
         # BOT MOVE
-        if mode == "pvb" and current_turn == BLACK and not dragger.dragging and not bot_thinking:
+        if (not game_over and mode == "pvb" and current_turn == BLACK and
+                not dragger.dragging and not bot_thinking):
             bot_thinking = True
-            draw_board(screen, board, last_move, hover_square, dragger)
-            buttons = draw_right_panel(screen, move_history, captured_white, captured_black, chat_lines, current_turn, mode, bot_thinking, white_time, black_time)
+            draw_board(screen, board, last_move, hover_square, dragger, en_passant_target)
+            buttons = draw_right_panel(screen, move_history, captured_white, captured_black, chat_lines,
+                                       current_turn, mode, bot_thinking, white_time, black_time)
             pygame.display.update()
 
-            score, bot_move = minimax(board, bot_depth, -math.inf, math.inf, False, BLACK)
+            score, bot_move = choose_ai_move(board, BLACK, bot_depth, en_passant_target, move_stack)
 
             if bot_move:
-                captured = make_move(board, bot_move)
+                en_passant_target, status_after, notation = apply_game_move(
+                    board, bot_move, BLACK, move_history, move_stack, captured_white, captured_black, en_passant_target
+                )
 
+                captured = move_stack[-1]["record"].get("captured")
                 if captured and CAPTURE_SOUND:
                     CAPTURE_SOUND.play()
+                elif status_after and status_after["type"] in ("check", "checkmate") and CHECK_SOUND:
+                    CHECK_SOUND.play()
                 elif MOVE_SOUND:
                     MOVE_SOUND.play()
-
-                if captured:
-                    captured_black.append(captured)
-
-                notation = move_to_notation(board, bot_move, captured)
-                move_history.append(notation)
-                move_stack.append((bot_move, captured, BLACK))
 
                 last_move = bot_move
                 current_turn = WHITE
                 bot_say(chat_lines, f"I played {notation}")
+                if status_after and status_after["type"] in ("checkmate", "stalemate"):
+                    game_over = status_after
             else:
+                game_over = get_game_status(board, current_turn, en_passant_target)
                 bot_say(chat_lines, "I have no legal moves.")
 
             bot_thinking = False
@@ -933,6 +1358,17 @@ def run_game(mode):
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return
+
+            # If the game is finished, only the popup buttons should work.
+            if game_over:
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    mx, my = event.pos
+                    if popup_buttons.get("menu") and popup_buttons["menu"].collidepoint(mx, my):
+                        return
+                    if popup_buttons.get("exit") and popup_buttons["exit"].collidepoint(mx, my):
+                        pygame.quit()
+                        sys.exit()
+                continue
 
             # Mouse movement
             if event.type == pygame.MOUSEMOTION:
@@ -953,14 +1389,21 @@ def run_game(mode):
                 if buttons.get("play_ai") and buttons["play_ai"].collidepoint(mx, my):
                     mode = "pvb"
                     bot_depth = 3
+                    if not chat_lines:
+                        chat_lines.append("Bot: Good luck!")
                     bot_say(chat_lines, "AI mode enabled.")
                 if buttons.get("undo") and buttons["undo"].collidepoint(mx, my):
                     # In player vs AI, undo both the AI move and the player's move if possible.
-                    undone = undo_last_move(board, move_history, move_stack, captured_white, captured_black)
+                    undone, prev_ep = undo_last_move(board, move_history, move_stack, captured_white, captured_black)
+                    if prev_ep is not None or undone is not None:
+                        en_passant_target = prev_ep
                     if mode == "pvb" and undone == BLACK:
-                        undo_last_move(board, move_history, move_stack, captured_white, captured_black)
+                        undone, prev_ep = undo_last_move(board, move_history, move_stack, captured_white, captured_black)
+                        if prev_ep is not None or undone is not None:
+                            en_passant_target = prev_ep
                     current_turn = WHITE if mode == "pvb" else (undone or current_turn)
-                    last_move = move_stack[-1][0] if move_stack else None
+                    last_move = move_stack[-1]["move"] if move_stack else None
+                    dragger.stop_drag()
                     continue
 
                 pos = board_coords_from_mouse(mx, my)
@@ -978,39 +1421,40 @@ def run_game(mode):
 
                     if pos:
                         r2, c2 = pos
-                        move = (dragger.start_row, dragger.start_col, r2, c2)
-                        legal_moves = generate_legal_moves(board, current_turn)
+                        attempted_move = (dragger.start_row, dragger.start_col, r2, c2)
+                        legal_moves = generate_legal_moves(board, current_turn, en_passant_target)
+                        move = find_matching_move(attempted_move, legal_moves)
 
-                        if move in legal_moves:
+                        if move:
                             mover = current_turn
-                            captured = make_move(board, move)
+                            en_passant_target, status_after, notation = apply_game_move(
+                                board, move, mover, move_history, move_stack, captured_white, captured_black, en_passant_target
+                            )
 
+                            captured = move_stack[-1]["record"].get("captured")
                             if captured and CAPTURE_SOUND:
                                 CAPTURE_SOUND.play()
+                            elif status_after and status_after["type"] in ("check", "checkmate") and CHECK_SOUND:
+                                CHECK_SOUND.play()
                             elif MOVE_SOUND:
                                 MOVE_SOUND.play()
 
-                            if captured:
-                                if current_turn == WHITE:
-                                    captured_white.append(captured)
-                                else:
-                                    captured_black.append(captured)
-
-                            notation = move_to_notation(board, move, captured)
-                            move_history.append(notation)
-                            move_stack.append((move, captured, mover))
-
                             last_move = move
-                            current_turn = BLACK if current_turn == WHITE else WHITE
+                            current_turn = other(current_turn)
 
-                            if current_turn == BLACK and mode == "pvb":
+                            if status_after and status_after["type"] in ("checkmate", "stalemate"):
+                                game_over = status_after
+                            elif current_turn == BLACK and mode == "pvb":
                                 bot_say(chat_lines, "Thinking...")
 
                     dragger.stop_drag()
 
         # DRAW EVERYTHING
-        draw_board(screen, board, last_move, hover_square, dragger)
-        buttons = draw_right_panel(screen, move_history, captured_white, captured_black, chat_lines, current_turn, mode, bot_thinking, white_time, black_time)
+        draw_board(screen, board, last_move, hover_square, dragger, en_passant_target)
+        buttons = draw_right_panel(screen, move_history, captured_white, captured_black, chat_lines,
+                                   current_turn, mode, bot_thinking, white_time, black_time)
+        if game_over:
+            popup_buttons = draw_game_over_popup(screen, game_over["title"], game_over["message"])
 
         pygame.display.update()
 
@@ -1084,7 +1528,7 @@ def main():
                         choosing_difficulty = False
 
                     elif hard_panel.collidepoint(mx, my):
-                        bot_depth = 4
+                        bot_depth = 3
                         mode = "pvb"
                         choosing_difficulty = False
 
